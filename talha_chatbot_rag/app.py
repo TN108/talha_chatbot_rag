@@ -1,112 +1,75 @@
-# app.py
 import os
-import subprocess
 import streamlit as st
 from dotenv import load_dotenv
-
-# LangChain / model imports (same as before)
 from langchain_groq import ChatGroq
-from langchain.prompts import ChatPromptTemplate
+from langchain.chains import ConversationalRetrievalChain
+from langchain.memory import ConversationBufferMemory
 from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain.schema.runnable import RunnablePassthrough
-from langchain.schema.output_parser import StrOutputParser
 
-# Load local .env when running locally
+# ---------------------------
+# Load environment variables
+# ---------------------------
 load_dotenv()
+api_key = os.getenv("GROQ_API_KEY")
 
-INDEX_DIR = "index"
+if not api_key:
+    st.error("❌ GROQ_API_KEY not found. Please set it in your .env file (local) or Streamlit Secrets (cloud).")
+    st.stop()
 
-def index_exists():
-    """Return True if index dir exists and has files (basic check)."""
-    if not os.path.isdir(INDEX_DIR):
-        return False
-    # consider non-empty dir as index present
-    return any(os.scandir(INDEX_DIR))
+# ---------------------------
+# Load FAISS Vectorstore
+# ---------------------------
+def load_vectorstore():
+    if not os.path.exists("faiss_index"):
+        st.error("⚠️ Vector index not found. Please run `ingest.py` first to build it.")
+        st.stop()
 
-def build_index_with_subprocess():
-    """Run ingest.py in a subprocess to build index. Raises CalledProcessError on failure."""
-    # Use the same python executable
-    cmd = [os.sys.executable, "ingest.py"]
-    # Show progress in Streamlit
-    with st.spinner("Building vector index (this may take a minute)..."):
-        subprocess.run(cmd, check=True)
+    embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+    return FAISS.load_local("faiss_index", embeddings, allow_dangerous_deserialization=True)
 
-# ---------------- Streamlit UI ----------------
-st.set_page_config(page_title="Talha Chatbot", page_icon="🤖", layout="centered")
+vectorstore = load_vectorstore()
+
+# ---------------------------
+# Setup Groq LLM + QA chain
+# ---------------------------
+llm = ChatGroq(
+    temperature=0,
+    groq_api_key=api_key,
+    model_name="llama-3.3-70b-versatile"   # ✅ locked to 70B model
+)
+
+memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
+
+qa_chain = ConversationalRetrievalChain.from_llm(
+    llm,
+    retriever=vectorstore.as_retriever(),
+    memory=memory
+)
+
+# ---------------------------
+# Streamlit UI
+# ---------------------------
 st.title("🤖 Ask about Muhammad Talha Nasir")
 st.caption("Answers grounded in my CV & projects. If it's not in my docs, I'll say I don't know.")
 
-# Ensure index exists (auto-build if missing)
-if not index_exists():
-    st.warning("Vector index not found. Building it now... (this can take 30-90 seconds depending on internet/CPU).")
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+
+# Input box
+prompt = st.text_input("Ask a question:")
+
+if prompt:
     try:
-        build_index_with_subprocess()
-    except subprocess.CalledProcessError as e:
-        st.error("Failed to build the vector index. See logs below.")
-        st.code(str(e))
-        st.stop()
+        response = qa_chain({"question": prompt})
+        answer = response["answer"]
 
-# --- Load API key ---
-api_key = os.getenv("GROQ_API_KEY") or st.secrets.get("GROQ_API_KEY")
-if not api_key:
-    st.error("Missing GROQ_API_KEY. Set it locally or in Streamlit Secrets.")
-    st.stop()
+        # Display user + bot messages
+        st.session_state.chat_history.append(("You", prompt))
+        st.session_state.chat_history.append(("Bot", answer))
 
-# --- Prepare LLM & retriever ---
-llm = ChatGroq(model_name="llama-3.1-8b-instant", temperature=0.1, groq_api_key=api_key)
+        for role, msg in st.session_state.chat_history:
+            st.write(f"**{role}:** {msg}")
 
-try:
-    embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-    db = FAISS.load_local(INDEX_DIR, embeddings, allow_dangerous_deserialization=True)
-except Exception as e:
-    st.error("Failed to load vector index after building. Error:")
-    st.code(str(e))
-    st.stop()
-
-retriever = db.as_retriever(search_kwargs={"k": 4})
-
-def format_docs(docs):
-    lines = []
-    for i, d in enumerate(docs, start=1):
-        src = d.metadata.get("source", "doc")
-        lines.append(f"[{i}] ({src})\n{d.page_content}")
-    return "\n\n".join(lines)
-
-SYSTEM_PROMPT = """
-You are an assistant for answering questions about Muhammad Talha Nasir.
-Use ONLY the provided context to answer.
-If the answer is not explicitly in the context, say: "I don't know based on my documents."
-Be concise and professional. Include short sources like [1], [2].
-"""
-
-prompt = ChatPromptTemplate.from_messages([
-    ("system", SYSTEM_PROMPT + "\n\nContext:\n{context}"),
-    ("human", "{question}")
-])
-
-chain = {
-    "context": retriever | format_docs,
-    "question": RunnablePassthrough(),
-} | prompt | llm | StrOutputParser()
-
-# Chat UI
-if "history" not in st.session_state:
-    st.session_state.history = []  # list of (user, bot)
-
-user_q = st.text_input("Ask me about my skills, projects, or education:")
-ask = st.button("Ask", type="primary")
-
-if ask and user_q.strip():
-    with st.spinner("Thinking..."):
-        answer = chain.invoke(user_q.strip())
-    st.session_state.history.append((user_q.strip(), answer))
-
-for u, a in reversed(st.session_state.history[-8:]):  # show last 8 exchanges
-    with st.chat_message("user"):
-        st.write(u)
-    with st.chat_message("assistant"):
-        st.write(a)
-
-st.divider()
-st.caption("Tip: Ask things like 'What is the Job Application Assistant project?' or 'What is Talha's education?'")
+    except Exception as e:
+        st.error(f"⚠️ Error: {e}")
